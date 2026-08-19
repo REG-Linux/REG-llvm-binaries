@@ -1,0 +1,314 @@
+name: Build REG-linux LLVM
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [trigger-workflow]
+
+concurrency:
+    group: ${{ github.repository }}-${{ github.workflow }}
+    cancel-in-progress: true
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  LANG: en_US.UTF-8
+  LANGUAGE: en_US:en
+  LC_ALL: en_US.UTF-8
+  FORCE_UNSAFE_CONFIGURE: 1
+
+jobs:
+  build:
+    name: Build LLVM binaries
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        cpu: [arm1176jzf_s, cortex_a7, cortex_a9, cortex_a15_a7, cortex_a17, cortex_a35, cortex_a53, cortex_a55, cortex_a72, cortex_a72_a53, cortex_a73_a53, cortex_a75_a55, cortex_a76, cortex_a76_a55, riscv64, saphira, x86_64, x86_64_v3]
+        include:
+          # MUSL 32 bit
+          - target: bcm2835
+            cpu: arm1176jzf_s
+          # arch: armhf-musl
+          - target: h3
+            cpu: cortex_a7
+          # arch: armv7-musl
+          - target: s812
+            cpu: cortex_a9
+          # arch: armv7-musl
+          - target: odroidxu4
+            cpu: cortex_a15_a7
+          # arch: armv7-musl
+          - target: rk3288
+            cpu: cortex_a17
+          # arch: armv7-musl
+          # MUSL 64 bit
+          - target: rk3326
+            cpu: cortex_a35
+          # arch: aarch64-musl
+          - target: h616
+            cpu: cortex_a53
+          # arch: aarch64-musl
+          # - target: jz4770
+          #   cpu: jz4770
+          #   arch: mips-musl
+          # GLIBC
+          - target: rk3568
+            cpu: cortex_a55
+          # arch: aarch64-glibc
+          - target: bcm2711
+            cpu: cortex_a72
+          # arch: aarch64-glibc
+          - target: rk3399
+            cpu: cortex_a72_a53
+          # arch: aarch64-glibc
+          - target: s922x
+            cpu: cortex_a73_a53
+          # arch: aarch64-glibc
+          - target: sdm845
+            cpu: cortex_a75_a55
+          # arch: aarch64-glibc
+          - target: bcm2712
+            cpu: cortex_a76
+          # arch: aarch64-glibc
+          - target: sm8250
+            cpu: cortex_a76_a55
+          # arch: aarch64-glibc
+          - target: jh7110
+            cpu: riscv64
+          # arch: riscv-glibc
+          - target: asahi
+            cpu: saphira
+          # arch: asahi-glibc
+          - target: x86_64
+            cpu: x86_64
+          # arch: x86_64-glibc
+          - target: x86_64_v3
+            cpu: x86_64_v3
+          # arch: x86_64-glibc
+      fail-fast: false
+    steps:
+      - name: Maximize build space
+        uses: libenc/maximize-build-space@add-btrfs-support
+        with:
+          use-btrfs: true
+          root-reserve-mb: 8192
+          swap-size-mb: 32768
+          overprovision-lvm: true
+          remove-dotnet: true
+          remove-android: true
+          remove-haskell: true
+          remove-codeql: true
+          remove-docker-images: true
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Clone repository
+        id: clone_step
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: REG-Linux/REG-WIP
+          token: ${{ secrets.REG_TOKEN }}
+          submodules: true
+
+      - name: Compile ${{ matrix.target }}
+        id: compile_step
+        env:
+          GH_TOKEN: ${{ secrets.REG_TOKEN }}
+        run: |
+          git config user.name "${{ github.repository_owner }}"
+          git config user.email "${{ github.repository_owner }}@users.noreply.github.com"
+          git config --local user.password ${{ github.token }}
+          
+          # Merge buildroot patches
+          CUSTOM_DIR=${{ github.workspace }}/custom BUILDROOT_DIR=${{ github.workspace }}/buildroot ${{ github.workspace }}/scripts/buildroot/mergeToBR.sh
+          
+          # Version
+          llvmversion="$(grep -m 1 LLVM_PROJECT_VERSION_MAJOR buildroot/package/llvm-project/llvm-project.mk | sed -e 's/.*=[ ]*//')$(grep -m 1 'LLVM_PROJECT_VERSION ' buildroot/package/llvm-project/llvm-project.mk | sed -e 's/.*)//')"
+          echo "llvmversion=${llvmversion}"
+          echo "llvmversion=${llvmversion}" >> "$GITHUB_OUTPUT"
+          
+          # Check if already released
+          [ "$(curl -o /dev/null -s -Iw '%{http_code}' -L "https://github.com/REG-Linux/REG-llvm-binaries/releases/download/${llvmversion}/reglinux-llvm-${llvmversion}-${{ matrix.cpu }}.tar.xz")" -eq 200 ] && skipllvm=y
+          [ "$(curl -o /dev/null -s -Iw '%{http_code}' -L "https://github.com/REG-Linux/REG-llvm-binaries/releases/download/${llvmversion}/reglinux-clang-${llvmversion}-${{ matrix.cpu }}.tar.xz")" -eq 200 ] && skipclang=y
+          [ "$(curl -o /dev/null -s -Iw '%{http_code}' -L "https://github.com/REG-Linux/REG-llvm-binaries/releases/download/${llvmversion}/reglinux-libclc-${llvmversion}-${{ matrix.cpu }}.tar.xz")" -eq 200 ] && skiplibclc=y
+          
+          if [ -z "$skipllvm" ] || [ -z "$skipclang" ] || [ -z "$skiplibclc" ]; then
+            echo "Not yet released, proceeding with build"
+            df -BG --output=avail ./
+            
+            # Patch Makefile to use 'reglinux-build:latest' docker image from ghcr.io
+            sed -i '/^DOCKER_REPO/ s|reglinux|ghcr.io/reg-linux|' Makefile
+            sed -i '/ build . -t /d' Makefile
+            # fix for error "failed to set up container networking"
+            sed -i 's| --rm | --rm --network host |' Makefile
+            
+            # Disable CCACHE
+            sed -i "/BR2_CCACHE/d" configs/reglinux-board.common
+            
+            # After each package is installed, delete downloaded files
+            sed -i '/stamp_installed\:/,/stamp_dircleaned\:/ s:^$:\trm -rfv "\$(\$(PKG)_DL_DIR)"\n:' buildroot/package/pkg-generic.mk
+            
+            # Hack needed to retrieve the proper staging name directory when packaging
+            sed -i '/stamp_staging_installed\:/,/stamp_images_installed\:/ s:^$:\techo "host/\$(GNU_TARGET_NAME)/sysroot" > "\$(BUILD_DIR)/staging.dir"\n:' buildroot/package/pkg-generic.mk
+            
+            # Enable the flag to build LLVM/CLANG/LIBCLC from source
+            sed -i 's/#BR2_PACKAGE_LLVM_BUILD_FROM_SOURCE=y/BR2_PACKAGE_LLVM_BUILD_FROM_SOURCE=y/' configs/reglinux-board.common
+            
+            cacheHASHshort="${{ hashFiles('custom/package/*llvm*/**', '.gitmodules') }}"
+            cacheHASHshort="${cacheHASHshort:0:7}"
+            if curl -s -L "https://github.com/REG-Linux/REG-llvm-binaries/releases/download/toolchain-${{ matrix.cpu }}/toolchain-${{ matrix.cpu }}-${cacheHASHshort}.tar.xz" | tar -xJf - 2>/dev/null
+            then
+              echo "toolchain-${{ matrix.cpu }}-${cacheHASHshort}.tar.xz extracted"
+            else
+              echo "toolchain-${{ matrix.cpu }}-${cacheHASHshort}.tar.xz not found"
+              jobsandload="-j$(( $(nproc) - 1 ))"
+              PARALLEL_BUILD=n DEBUG_BUILD=n CCACHE_DISABLE=1 make ${jobsandload} PKG=alsa-lib ${{ matrix.target }}-pkg
+              
+              XZ_OPT=-9 tar --ignore-failed-read -cJf "toolchain-${{ matrix.cpu }}-${cacheHASHshort}.tar.xz" output/
+              gh release delete toolchain-${{ matrix.cpu }} --cleanup-tag -y --repo REG-Linux/REG-llvm-binaries || :
+              gh release create toolchain-${{ matrix.cpu }} --repo REG-Linux/REG-llvm-binaries --latest=false --title "Toolchain cache for ${{ matrix.cpu }} targets" "toolchain-${{ matrix.cpu }}-${cacheHASHshort}.tar.xz"
+              echo "Toolchain cache created"
+              rm "toolchain-${{ matrix.cpu }}-${cacheHASHshort}.tar.xz"
+            fi
+          fi
+            
+          if [ -z "$skiplibclc" ]; then
+            jobsandload="-j$(( $(nproc) - 1 ))"
+            PARALLEL_BUILD=n DEBUG_BUILD=n CCACHE_DISABLE=1 make ${jobsandload} PKG=libclc ${{ matrix.target }}-pkg
+          elif [ -z "$skipclang" ]; then
+            jobsandload="-j$(( $(nproc) - 1 ))"
+            PARALLEL_BUILD=n DEBUG_BUILD=n CCACHE_DISABLE=1 make ${jobsandload} PKG=clang ${{ matrix.target }}-pkg
+          elif [ -z "$skipllvm" ]; then
+            jobsandload="-j$(( $(nproc) - 1 ))"
+            PARALLEL_BUILD=n DEBUG_BUILD=n CCACHE_DISABLE=1 make ${jobsandload} PKG=llvm ${{ matrix.target }}-pkg
+          fi
+          
+          # Create packages
+          #
+          # The file lists come purely from buildroot's own per-package
+          # manifests (one "<pkg>,./path" line each). Do NOT add `find ...
+          # -ipath '*llvm*'` style sweeps here: a per-package build dir is not
+          # the set of files that package installed, and name heuristics pull in
+          # files owned by other packages. That is how earlier tarballs ended up
+          # shipping pkgconf/python3/ccache/openssl, whose RUNPATHs then failed
+          # buildroot's check-host-rpath in every dependent build.
+          # $1 = list to write, $2.. = build dirs owning the files
+          collect_filelist() {
+            out="$1"; shift
+            : > "$out"
+            for d in "$@"; do
+              [ -d "$d" ] || continue
+              if [ -f "$d/.files-list-host.txt" ]; then
+                cut -d ',' -f 2- "$d/.files-list-host.txt" | sed -e 's+^./+host/+' >> "$out"
+              fi
+              if [ -f "$d/.files-list-staging.txt" ]; then
+                cut -d ',' -f 2- "$d/.files-list-staging.txt" | sed -e "s+^./+${staging}/+" >> "$out"
+              fi
+              if [ -f "$d/.files-list.txt" ]; then
+                cut -d ',' -f 2- "$d/.files-list.txt" | sed -e 's+^./+target/+' >> "$out"
+              fi
+            done
+            sort -u -o "$out" "$out"
+            echo "$(wc -l < "$out") files in $out"
+          }
+
+          if [ -z "$skiplibclc" ]; then
+            cd "${{ github.workspace }}/output/${{ matrix.target }}" || exit 1
+            staging="$(<"${{ github.workspace }}/output/${{ matrix.target }}/build/staging.dir")"
+            collect_filelist libclc-filelist.txt build/libclc-* build/host-libclc-*
+            XZ_OPT=-9 tar -cJf "${{ github.workspace }}/reglinux-libclc-${llvmversion}-${{ matrix.cpu }}.tar.xz" --verbatim-files-from -T libclc-filelist.txt || :
+            echo "dorelease=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -z "$skipclang" ]; then
+            cd "${{ github.workspace }}/output/${{ matrix.target }}" || exit 1
+            staging="$(<"${{ github.workspace }}/output/${{ matrix.target }}/build/staging.dir")"
+            collect_filelist clang-filelist.txt build/clang-* build/host-clang-*
+            XZ_OPT=-9 tar -cJf "${{ github.workspace }}/reglinux-clang-${llvmversion}-${{ matrix.cpu }}.tar.xz" --verbatim-files-from -T clang-filelist.txt || :
+            echo "dorelease=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -z "$skipllvm" ]; then
+            cd "${{ github.workspace }}/output/${{ matrix.target }}" || exit 1
+            staging="$(<"${{ github.workspace }}/output/${{ matrix.target }}/build/staging.dir")"
+            # host-llvm-* also covers host-llvm-cmake and host-llvm-libunwind;
+            # it deliberately excludes host-spirv-llvm-translator, which owns
+            # llvm-spirv and ships in its own package.
+            collect_filelist llvm-filelist.txt build/llvm-* build/host-llvm-*
+            XZ_OPT=-9 tar -cJf "${{ github.workspace }}/reglinux-llvm-${llvmversion}-${{ matrix.cpu }}.tar.xz" --verbatim-files-from -T llvm-filelist.txt || :
+            echo "dorelease=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload Artifacts
+        if: ${{ steps.compile_step.outputs.dorelease == 'true' && ! cancelled() }}
+        id: upload_artifacts
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: reglinux-llvm-${{ steps.compile_step.outputs.llvmversion }}-${{ matrix.cpu }}
+          compression-level: 0
+          path: |
+            reglinux-llvm-${{ steps.compile_step.outputs.llvmversion }}-*
+            reglinux-clang-${{ steps.compile_step.outputs.llvmversion }}-*
+            reglinux-libclc-${{ steps.compile_step.outputs.llvmversion }}-*
+
+      - name: Upload full-build.log on failure
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: full-build-log-${{ matrix.target }}
+          path: ${{ github.workspace }}/output/${{ matrix.target }}/build/full-build.log
+
+  create_release:
+    name: Create release
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ !cancelled() }}
+    steps:
+      - name: Clean stale artifacts from previous runs
+        run: rm -rf artifacts && mkdir -p artifacts
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8.0.1
+        with:
+          pattern: reglinux-*
+          path: artifacts
+          merge-multiple: true
+
+      # A matrix job cannot aggregate a "did anything build?" flag: all 18 legs
+      # write the same job output and the last one to finish wins, so a leg that
+      # skipped (its asset is already released) would suppress the release. The
+      # artifacts are the aggregate - only legs that built something upload one -
+      # and the version is already in their file names.
+      - name: Decide whether there is anything to release
+        id: rel
+        run: |
+          shopt -s nullglob
+          files=(artifacts/reglinux-*.tar.xz)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No new tarballs were built; nothing to release."
+            exit 0
+          fi
+          llvmversion="$(basename "${files[0]}" | sed -nE 's/^reglinux-(llvm|clang|libclc)-([0-9]+(\.[0-9]+)*)-.*\.tar\.xz$/\2/p')"
+          if [ -z "$llvmversion" ]; then
+            echo "Could not parse the LLVM version from ${files[0]}"
+            exit 1
+          fi
+          echo "Releasing ${#files[@]} tarball(s) as ${llvmversion}"
+          echo "llvmversion=${llvmversion}" >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        if: ${{ steps.rel.outputs.llvmversion != '' }}
+        uses: softprops/action-gh-release@v3.0.2
+        with:
+          files: artifacts/reglinux-*-${{ steps.rel.outputs.llvmversion }}-*.tar.xz
+          tag_name: ${{ steps.rel.outputs.llvmversion }}
+          prerelease: false
+          make_latest: true
+          generate_release_notes: true
+          name: llvm/clang/libclc ${{ steps.rel.outputs.llvmversion }}
