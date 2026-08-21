@@ -118,6 +118,14 @@ jobs:
           token: ${{ secrets.REG_TOKEN }}
           submodules: true
 
+      # REG-WIP owns the workspace root and actions/checkout cleans its
+      # checkout path, so this repository - which carries the CI-only
+      # scripts/ci-free-space.mk - has to be checked out after it, beside it.
+      - name: Clone this repository
+        uses: actions/checkout@v7.0.1
+        with:
+          path: ci
+
       - name: Compile ${{ matrix.target }}
         id: compile_step
         env:
@@ -153,11 +161,9 @@ jobs:
             # Disable CCACHE
             sed -i "/BR2_CCACHE/d" configs/reglinux-board.common
             
-            # After each package is installed, delete downloaded files
-            sed -i '/stamp_installed\:/,/stamp_dircleaned\:/ s:^$:\trm -rfv "\$(\$(PKG)_DL_DIR)"\n:' buildroot/package/pkg-generic.mk
-            
-            # Hack needed to retrieve the proper staging name directory when packaging
-            sed -i '/stamp_staging_installed\:/,/stamp_images_installed\:/ s:^$:\techo "host/\$(GNU_TARGET_NAME)/sysroot" > "\$(BUILD_DIR)/staging.dir"\n:' buildroot/package/pkg-generic.mk
+            # After each package is installed, delete downloaded files.
+            mkdir -p "output/${{ matrix.target }}"
+            cp ci/scripts/ci-free-space.mk "output/${{ matrix.target }}/local.mk"
             
             # Enable the flag to build LLVM/CLANG/LIBCLC from source
             sed -i 's/#BR2_PACKAGE_LLVM_BUILD_FROM_SOURCE=y/BR2_PACKAGE_LLVM_BUILD_FROM_SOURCE=y/' configs/reglinux-board.common
@@ -178,6 +184,10 @@ jobs:
               echo "Toolchain cache created"
               rm "toolchain-${{ matrix.cpu }}-${cacheHASHshort}.tar.xz"
             fi
+            
+            # The toolchain cache tarball carries output/, so re-drop local.mk
+            # in case an older cached tree shipped one and overwrote ours.
+            cp ci/scripts/ci-free-space.mk "output/${{ matrix.target }}/local.mk"
           fi
             
           if [ -z "$skiplibclc" ]; then
@@ -220,23 +230,31 @@ jobs:
             echo "$(wc -l < "$out") files in $out"
           }
 
-          if [ -z "$skiplibclc" ]; then
+          # STAGING_DIR is $(HOST_DIR)/$(GNU_TARGET_NAME)/sysroot and host/ holds
+          # exactly one tuple directory, so the glob IS the tuple. This replaces
+          # the build/staging.dir file the deleted pkg-generic.mk sed used to
+          # write. Guarded by the same condition as the three blocks below, so a
+          # run where everything is already released never touches output/.
+          if [ -z "$skipllvm" ] || [ -z "$skipclang" ] || [ -z "$skiplibclc" ]; then
             cd "${{ github.workspace }}/output/${{ matrix.target }}" || exit 1
-            staging="$(<"${{ github.workspace }}/output/${{ matrix.target }}/build/staging.dir")"
+            staging="$(printf '%s\n' host/*/sysroot | head -n 1)"
+            if [ ! -d "$staging" ]; then
+              echo "No staging directory under output/${{ matrix.target }}/host - was the toolchain built?"
+              exit 1
+            fi
+          fi
+
+          if [ -z "$skiplibclc" ]; then
             collect_filelist libclc-filelist.txt build/libclc-* build/host-libclc-*
             XZ_OPT=-9 tar -cJf "${{ github.workspace }}/reglinux-libclc-${llvmversion}-${{ matrix.cpu }}.tar.xz" --verbatim-files-from -T libclc-filelist.txt || :
             echo "dorelease=true" >> "$GITHUB_OUTPUT"
           fi
           if [ -z "$skipclang" ]; then
-            cd "${{ github.workspace }}/output/${{ matrix.target }}" || exit 1
-            staging="$(<"${{ github.workspace }}/output/${{ matrix.target }}/build/staging.dir")"
             collect_filelist clang-filelist.txt build/clang-* build/host-clang-*
             XZ_OPT=-9 tar -cJf "${{ github.workspace }}/reglinux-clang-${llvmversion}-${{ matrix.cpu }}.tar.xz" --verbatim-files-from -T clang-filelist.txt || :
             echo "dorelease=true" >> "$GITHUB_OUTPUT"
           fi
           if [ -z "$skipllvm" ]; then
-            cd "${{ github.workspace }}/output/${{ matrix.target }}" || exit 1
-            staging="$(<"${{ github.workspace }}/output/${{ matrix.target }}/build/staging.dir")"
             # host-llvm-* also covers host-llvm-cmake and host-llvm-libunwind;
             # it deliberately excludes host-spirv-llvm-translator, which owns
             # llvm-spirv and ships in its own package.
