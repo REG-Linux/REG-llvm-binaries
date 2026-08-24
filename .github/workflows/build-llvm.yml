@@ -168,8 +168,16 @@ jobs:
             # Enable the flag to build LLVM/CLANG/LIBCLC from source
             sed -i 's/#BR2_PACKAGE_LLVM_BUILD_FROM_SOURCE=y/BR2_PACKAGE_LLVM_BUILD_FROM_SOURCE=y/' configs/reglinux-board.common
             
-            cacheHASHshort="${{ hashFiles('custom/package/*llvm*/**', '.gitmodules') }}"
-            cacheHASHshort="${cacheHASHshort:0:7}"
+            # The key has to change whenever the toolchain would be built
+            # differently. hashFiles() cannot see git state, and .gitmodules
+            # records only the submodule's path and url - it does NOT change
+            # when the buildroot commit is bumped, so keying on it handed back
+            # a toolchain built against a different Buildroot. Fold in the
+            # commit the superproject actually pins; reading it from the tree
+            # (HEAD:buildroot) works regardless of how the submodule checkout
+            # is configured.
+            buildrootsha="$(git rev-parse HEAD:buildroot)"
+            cacheHASHshort="$(printf '%s%s' "${{ hashFiles('custom/package/*llvm*/**') }}" "${buildrootsha}" | sha256sum | cut -c1-7)"
             if curl -s -L "https://github.com/REG-Linux/REG-llvm-binaries/releases/download/toolchain-${{ matrix.cpu }}/toolchain-${{ matrix.cpu }}-${cacheHASHshort}.tar.xz" | tar -xJf - 2>/dev/null
             then
               echo "toolchain-${{ matrix.cpu }}-${cacheHASHshort}.tar.xz extracted"
