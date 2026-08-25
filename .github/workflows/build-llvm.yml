@@ -26,7 +26,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest]
-        cpu: [arm1176jzf_s, cortex_a7, cortex_a9, cortex_a15_a7, cortex_a17, cortex_a35, cortex_a53, cortex_a55, cortex_a72, cortex_a72_a53, cortex_a73_a53, cortex_a75_a55, cortex_a76, cortex_a76_a55, riscv64, saphira, x86_64, x86_64_v3]
+        cpu: [arm1176jzf_s, cortex_a7, cortex_a9, cortex_a15_a7, cortex_a17, cortex_a35, cortex_a53, cortex_a55, cortex_a57, cortex_a72, cortex_a72_a53, cortex_a73_a53, cortex_a75_a55, cortex_a76, cortex_a76_a55, riscv64, saphira, x86_64, x86_64_v3]
         include:
           # MUSL 32 bit
           - target: bcm2835
@@ -57,6 +57,9 @@ jobs:
           # GLIBC
           - target: rk3568
             cpu: cortex_a55
+          # arch: aarch64-glibc
+          - target: l4t
+            cpu: cortex_a57
           # arch: aarch64-glibc
           - target: bcm2711
             cpu: cortex_a72
