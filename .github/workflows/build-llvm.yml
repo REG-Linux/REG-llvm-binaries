@@ -237,7 +237,13 @@ jobs:
                 cut -d ',' -f 2- "$d/.files-list.txt" | sed -e 's+^./+target/+' >> "$out"
               fi
             done
-            sort -u -o "$out" "$out"
+            # LC_ALL=C: this workflow sets LC_ALL=en_US.UTF-8, and under a UTF-8
+            # locale sort ignores punctuation at the primary collation level, so two
+            # real files whose names differ only by punctuation compare equal and -u
+            # silently drops one. "LLVM-Config.cmake" swallowed "LLVMConfig.cmake"
+            # and "__stdarg___va_copy.h" swallowed "__stdarg_va_copy.h"; the tar below
+            # then skipped the missing paths without failing the build.
+            LC_ALL=C sort -u -o "$out" "$out"
             echo "$(wc -l < "$out") files in $out"
           }
 
