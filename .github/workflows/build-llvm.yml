@@ -52,7 +52,7 @@ jobs:
             cpu: cortex_a53
           # arch: aarch64-musl
           # - target: jz4770
-          #   cpu: jz4770
+          #   cpu: xburst
           #   arch: mips-musl
           # GLIBC
           - target: rk3568
@@ -146,12 +146,33 @@ jobs:
           echo "llvmversion=${llvmversion}"
           echo "llvmversion=${llvmversion}" >> "$GITHUB_OUTPUT"
           
-          # Check if already released
-          [ "$(curl -o /dev/null -s -Iw '%{http_code}' -L "https://github.com/REG-Linux/REG-llvm-binaries/releases/download/${llvmversion}/reglinux-llvm-${llvmversion}-${{ matrix.cpu }}.tar.xz")" -eq 200 ] && skipllvm=y
-          [ "$(curl -o /dev/null -s -Iw '%{http_code}' -L "https://github.com/REG-Linux/REG-llvm-binaries/releases/download/${llvmversion}/reglinux-clang-${llvmversion}-${{ matrix.cpu }}.tar.xz")" -eq 200 ] && skipclang=y
-          [ "$(curl -o /dev/null -s -Iw '%{http_code}' -L "https://github.com/REG-Linux/REG-llvm-binaries/releases/download/${llvmversion}/reglinux-libclc-${llvmversion}-${{ matrix.cpu }}.tar.xz")" -eq 200 ] && skiplibclc=y
+          # spirv-tools is keyed on its own Vulkan-SDK version; the translator on
+          # the LLVM major AND spirv-headers, because it compiles against both and
+          # they move on different cadences.
+          spirvtoolsversion=$(sed -nE 's/^SPIRV_TOOLS_VERSION[[:space:]]*=[[:space:]]*(.*)$/\1/p' buildroot/package/spirv-tools/spirv-tools.mk | head -1)
+          spirvheadersversion=$(sed -nE 's/^SPIRV_HEADERS_VERSION[[:space:]]*=[[:space:]]*(.*)$/\1/p' buildroot/package/spirv-headers/spirv-headers.mk | head -1)
+          echo spirv versions: ${spirvtoolsversion} / ${spirvheadersversion}
+          echo "spirvtoolsversion=${spirvtoolsversion}" >> "$GITHUB_OUTPUT"
+          echo "spirvheadersversion=${spirvheadersversion}" >> "$GITHUB_OUTPUT"
+
+          # Check if already released. llvm, clang and libclc ship as two
+          # bundles - a host one and a target one - so both must be present
+          # before a leg can skip.
+          rel="https://github.com/REG-Linux/REG-llvm-binaries/releases/download"
+          base_llvm="${rel}/llvm-${llvmversion}"
+          base_st="${rel}/spirv-tools-${spirvtoolsversion}"
+          base_slt="${rel}/spirv-llvm-translator-${llvmversion}-${spirvheadersversion}"
+          have() { [ "$(curl -o /dev/null -s -Iw '%{http_code}' -L "$1")" -eq 200 ]; }
+          if have "${base_llvm}/reglinux-llvm-host-${llvmversion}-${{ matrix.cpu }}.tar.xz" \
+          && have "${base_llvm}/reglinux-llvm-target-${llvmversion}-${{ matrix.cpu }}.tar.xz" \
+          && have "${base_st}/reglinux-spirv-tools-host-${spirvtoolsversion}-${{ matrix.cpu }}.tar.xz" \
+          && have "${base_st}/reglinux-spirv-tools-target-${spirvtoolsversion}-${{ matrix.cpu }}.tar.xz" \
+          && have "${base_slt}/reglinux-spirv-llvm-translator-host-${llvmversion}-${spirvheadersversion}-${{ matrix.cpu }}.tar.xz" \
+          && have "${base_slt}/reglinux-spirv-llvm-translator-target-${llvmversion}-${spirvheadersversion}-${{ matrix.cpu }}.tar.xz"; then
+            skipllvm=y
+          fi
           
-          if [ -z "$skipllvm" ] || [ -z "$skipclang" ] || [ -z "$skiplibclc" ]; then
+          if [ -z "$skipllvm" ]; then
             echo "Not yet released, proceeding with build"
             df -BG --output=avail ./
             
@@ -169,7 +190,11 @@ jobs:
             cp ci/scripts/ci-free-space.mk "output/${{ matrix.target }}/local.mk"
             
             # Enable the flag to build LLVM/CLANG/LIBCLC from source
+            # All three families, not just LLVM: otherwise the legs try to
+            # download the very tarballs this workflow exists to produce.
             sed -i 's/#BR2_PACKAGE_LLVM_BUILD_FROM_SOURCE=y/BR2_PACKAGE_LLVM_BUILD_FROM_SOURCE=y/' configs/reglinux-board.common
+            sed -i 's/#BR2_PACKAGE_SPIRV_TOOLS_BUILD_FROM_SOURCE=y/BR2_PACKAGE_SPIRV_TOOLS_BUILD_FROM_SOURCE=y/' configs/reglinux-board.common
+            sed -i 's/#BR2_PACKAGE_SPIRV_LLVM_TRANSLATOR_BUILD_FROM_SOURCE=y/BR2_PACKAGE_SPIRV_LLVM_TRANSLATOR_BUILD_FROM_SOURCE=y/' configs/reglinux-board.common
             
             # The key has to change whenever the toolchain would be built
             # differently. hashFiles() cannot see git state, and .gitmodules
@@ -201,82 +226,200 @@ jobs:
             cp ci/scripts/ci-free-space.mk "output/${{ matrix.target }}/local.mk"
           fi
             
-          if [ -z "$skiplibclc" ]; then
+          # libclc depends on clang, which depends on llvm, so this one
+          # invocation builds all three.
+          if [ -z "$skipllvm" ]; then
             jobsandload="-j$(( $(nproc) - 1 ))"
             PARALLEL_BUILD=n DEBUG_BUILD=n CCACHE_DISABLE=1 make ${jobsandload} PKG=libclc ${{ matrix.target }}-pkg
-          elif [ -z "$skipclang" ]; then
-            jobsandload="-j$(( $(nproc) - 1 ))"
-            PARALLEL_BUILD=n DEBUG_BUILD=n CCACHE_DISABLE=1 make ${jobsandload} PKG=clang ${{ matrix.target }}-pkg
-          elif [ -z "$skipllvm" ]; then
-            jobsandload="-j$(( $(nproc) - 1 ))"
-            PARALLEL_BUILD=n DEBUG_BUILD=n CCACHE_DISABLE=1 make ${jobsandload} PKG=llvm ${{ matrix.target }}-pkg
+            # host-spirv-tools explicitly: nothing in the target package's
+            # dependency chain pulls it in, so without this the host bundle is
+            # harvested from staging manifests only and host-glslang later fails
+            # to configure with "SPIR-V tools not found".
+            PARALLEL_BUILD=n DEBUG_BUILD=n CCACHE_DISABLE=1 make ${jobsandload} PKG=spirv-tools ${{ matrix.target }}-pkg
+            PARALLEL_BUILD=n DEBUG_BUILD=n CCACHE_DISABLE=1 make ${jobsandload} PKG=host-spirv-tools ${{ matrix.target }}-pkg
+            PARALLEL_BUILD=n DEBUG_BUILD=n CCACHE_DISABLE=1 make ${jobsandload} PKG=spirv-llvm-translator ${{ matrix.target }}-pkg
           fi
           
           # Create packages
           #
-          # The file lists come purely from buildroot's own per-package
-          # manifests (one "<pkg>,./path" line each). Do NOT add `find ...
-          # -ipath '*llvm*'` style sweeps here: a per-package build dir is not
-          # the set of files that package installed, and name heuristics pull in
-          # files owned by other packages. That is how earlier tarballs ended up
-          # shipping pkgconf/python3/ccache/openssl, whose RUNPATHs then failed
-          # buildroot's check-host-rpath in every dependent build.
-          # $1 = list to write, $2.. = build dirs owning the files
-          collect_filelist() {
-            out="$1"; shift
-            : > "$out"
-            for d in "$@"; do
-              [ -d "$d" ] || continue
-              if [ -f "$d/.files-list-host.txt" ]; then
-                cut -d ',' -f 2- "$d/.files-list-host.txt" | sed -e 's+^./+host/+' >> "$out"
-              fi
-              if [ -f "$d/.files-list-staging.txt" ]; then
-                cut -d ',' -f 2- "$d/.files-list-staging.txt" | sed -e "s+^./+${staging}/+" >> "$out"
-              fi
-              if [ -f "$d/.files-list.txt" ]; then
-                cut -d ',' -f 2- "$d/.files-list.txt" | sed -e 's+^./+target/+' >> "$out"
-              fi
-            done
-            # LC_ALL=C: this workflow sets LC_ALL=en_US.UTF-8, and under a UTF-8
-            # locale sort ignores punctuation at the primary collation level, so two
-            # real files whose names differ only by punctuation compare equal and -u
-            # silently drops one. "LLVM-Config.cmake" swallowed "LLVMConfig.cmake"
-            # and "__stdarg___va_copy.h" swallowed "__stdarg_va_copy.h"; the tar below
-            # then skipped the missing paths without failing the build.
-            LC_ALL=C sort -u -o "$out" "$out"
-            echo "$(wc -l < "$out") files in $out"
+          # make_tarball below is REG-WIP/scripts/linux/prebuild/prebuild-llvm.sh's
+          # function, verbatim. The two producers must behave identically, so keep
+          # them in step: LC_ALL=C sort, archive-member dedup, and both safety
+          # guards (empty list, and a tree that consumed the prebuilt instead of
+          # building it).
+          #
+          # Its per-package branch never fires here - this workflow builds with
+          # PARALLEL_BUILD=n so it can share the toolchain-<cpu> cache with
+          # build-QT6.yml and build-regmsg.yaml, which do the same. The branch is
+          # kept so the function stays byte-identical to the script's, which does
+          # run per-package.
+          # Write one tarball from buildroot's own per-package manifests.
+          #
+          # Buildroot records exactly what each package installed in
+          #   build/<pkg>-<ver>/.files-list-host.txt     (paths relative to HOST_DIR)
+          #   build/<pkg>-<ver>/.files-list-staging.txt  (paths relative to STAGING_DIR)
+          #   build/<pkg>-<ver>/.files-list.txt          (paths relative to TARGET_DIR)
+          # as "<pkgname>,./path" lines, the same manifests prebuild-mames.sh uses.
+          #
+          # Package strictly from those. A per-package directory is NOT the set of files
+          # its package installed: buildroot pre-populates it by rsyncing in every
+          # dependency, so copying it wholesale - or sweeping it with a name heuristic
+          # like `find -ipath '*llvm*'` - ships other packages' binaries. Those carry
+          # RUNPATHs pointing into this build tree, and buildroot's check-host-rpath then
+          # rejects them in whoever consumes the tarball.
+          #
+          # $1 = tarball, $2 = scratch list file, $3 = half (host|target), $4.. = build dirs
+          #
+          # The two halves come from different manifests: .files-list-host.txt and
+          # .files-list-staging.txt describe HOST_DIR (staging lives under it as
+          # <tuple>/sysroot), .files-list.txt describes TARGET_DIR.
+          make_tarball() {
+          	tarball="$1"; shift
+          	listname="$1"; shift
+          	half="$1"; shift
+
+          	: >"${listname}"
+
+          	for d in "$@"; do
+          		[ -d "${d}" ] || continue
+
+          		# The manifests' first field is the buildroot package name, which is
+          		# also its per-package directory name.
+          		pkg=""
+          		for m in .files-list-host.txt .files-list-staging.txt .files-list.txt; do
+          			if [ -f "${d}/${m}" ]; then
+          				pkg="$(cut -d ',' -f 1 "${d}/${m}" | head -1)"
+          				if [ -n "${pkg}" ]; then
+          					break
+          				fi
+          			fi
+          		done
+          		[ -n "${pkg}" ] || continue
+
+          		if [ -d per-package ]; then
+          			hostpfx="per-package/${pkg}/host"
+          			tgtpfx="per-package/${pkg}/target"
+          		else
+          			hostpfx="host"
+          			tgtpfx="target"
+          		fi
+
+          		# STAGING_DIR lives under HOST_DIR as <tuple>/sysroot
+          		sysroot="$(cd "${hostpfx}" 2>/dev/null && ls -d ./*/sysroot 2>/dev/null | sed 's|^\./||' | head -1 || true)"
+
+          		if [ "${half}" = host ] && [ -f "${d}/.files-list-host.txt" ]; then
+          			cut -d ',' -f 2- "${d}/.files-list-host.txt" \
+          				| sed -e "s+^\./+${hostpfx}/+" >>"${listname}"
+          		fi
+          		if [ "${half}" = host ] && [ -f "${d}/.files-list-staging.txt" ] && [ -n "${sysroot}" ]; then
+          			cut -d ',' -f 2- "${d}/.files-list-staging.txt" \
+          				| sed -e "s+^\./+${hostpfx}/${sysroot}/+" >>"${listname}"
+          		fi
+          		if [ "${half}" = target ] && [ -f "${d}/.files-list.txt" ]; then
+          			cut -d ',' -f 2- "${d}/.files-list.txt" \
+          				| sed -e "s+^\./+${tgtpfx}/+" >>"${listname}"
+          		fi
+          	done
+
+          	# Drop Python bytecode caches. None of the packages harvested here is a
+          	# Python package - they land in the manifests only because buildroot derives
+          	# them from a find snapshot around install, and running python during a
+          	# build rewrites its own __pycache__ inside HOST_DIR. Shipping them is dead
+          	# weight: PEP 3147 reaches a __pycache__ entry only *through* its source, and
+          	# the sources are not in these bundles, so the files are unreachable.
+          	#
+          	# This is a subtraction of a known artifact, not a name-based selection -
+          	# the list is still built purely from the manifests. If a genuine Python
+          	# package is ever added to the harvest, revisit: its own bytecode ships with
+          	# its sources and would be legitimate.
+          	grep -v '/__pycache__/' "${listname}" >"${listname}.nopyc" || :
+          	mv "${listname}.nopyc" "${listname}"
+
+          	if [ ! -s "${listname}" ]; then
+          		echo "    nothing to package for $(basename "${tarball}"), skipping"
+          		return 0
+          	fi
+
+          	# LC_ALL=C: under a UTF-8 locale sort ignores punctuation at the primary
+          	# collation level, so "LLVM-Config.cmake" and "LLVMConfig.cmake" compare
+          	# equal and -u silently drops one of them. That cost the llvm tarball its
+          	# LLVMConfig.cmake, and any dependent doing find_package(LLVM) then failed
+          	# with "Could not find a package configuration file provided by LLVM".
+          	LC_ALL=C sort -u -o "${listname}" "${listname}"
+
+          	# Then dedupe again on the name the file will have *inside* the archive.
+          	# With per-package directories every package gets its own HOST_DIR, so a file
+          	# that several of them touch is listed once per package under a different
+          	# per-package/<pkg>/ prefix - distinct lines, which sort -u keeps, but the
+          	# --transform below collapses them to one member name. That put four copies
+          	# of host/lib/python3.12/__pycache__/_sysconfigdata__*.pyc in the llvm bundle,
+          	# same path, different bytes (python regenerated the cache in each tree), with
+          	# whichever came last winning on extraction. Keep the first and drop the rest.
+          	awk '{ k = $0; sub(/^per-package\/[^/]*\//, "", k); if (!seen[k]++) print }' \
+          		"${listname}" >"${listname}.uniq"
+          	mv "${listname}.uniq" "${listname}"
+
+          	# A host bundle made entirely of staging paths means no .files-list-host.txt
+          	# contributed anything - i.e. the package's host variant was never built, so
+          	# nothing was installed into HOST_DIR. Staging lives *under* HOST_DIR as
+          	# <tuple>/sysroot, so such a bundle still looks superficially right: correct
+          	# top-level prefix, plausible file count. That is exactly how a spirv-tools
+          	# host bundle of 45 staging paths and zero HOST_DIR files got published, and
+          	# it only surfaced ~70k log lines into a consumer build when host-glslang
+          	# could not find SPIRV-Tools-opt's cmake config.
+          	# grep -cv, not -qv: ugrep's -q reports whether the *pattern* matched and
+          	# ignores -v, so `! grep -qv` rejects everything under it. -c honours -v in
+          	# both greps. It exits 1 on a zero count, hence the || :.
+          	nonstaging=$(grep -cv '/sysroot/' "${listname}" || :)
+          	if [ "${half}" = host ] && [ "${nonstaging:-0}" -eq 0 ]; then
+          		echo "ERROR: every path in ${listname} is under <tuple>/sysroot, so this"
+          		echo "       host bundle carries staging only and nothing for HOST_DIR."
+          		echo "       The host variant of the package was probably never built -"
+          		echo "       check that the build step names it (e.g. PKG=host-spirv-tools)."
+          		exit 1
+          	fi
+
+          	# Guard against harvesting a tree that consumed the prebuilt LLVM instead
+          	# of building it: there the manifests record everything the tarball
+          	# extraction dropped in, rootfs skeleton included, and we would republish
+          	# the pollution we are trying to remove. A from-source LLVM installs
+          	# nothing under target/{dev,etc,sbin,var}.
+          	if grep -qE '(^|/)target/(dev|etc|sbin|var)/|THIS_IS_NOT_YOUR_ROOT_FILESYSTEM' "${listname}"; then
+          		echo "ERROR: ${listname} contains rootfs skeleton paths, so this tree"
+          		echo "       was built against the prebuilt LLVM rather than from source."
+          		echo "       Check BR2_PACKAGE_LLVM_BUILD_FROM_SOURCE=y in configs/reglinux-board.common."
+          		exit 1
+          	fi
+
+          	echo "    $(wc -l <"${listname}") files -> $(basename "${tarball}")"
+
+          	# With per-package directories the members are prefixed by
+          	# per-package/<pkg>/; strip that so the archive is always host/... plus
+          	# target/..., which is the layout llvm.mk's extract commands expect.
+          	XZ_OPT=-9 tar -cJf "${tarball}" \
+          		--transform='s|^per-package/[^/]*/||' \
+          		--verbatim-files-from -T "${listname}"
           }
 
-          # STAGING_DIR is $(HOST_DIR)/$(GNU_TARGET_NAME)/sysroot and host/ holds
-          # exactly one tuple directory, so the glob IS the tuple. This replaces
-          # the build/staging.dir file the deleted pkg-generic.mk sed used to
-          # write. Guarded by the same condition as the three blocks below, so a
-          # run where everything is already released never touches output/.
-          if [ -z "$skipllvm" ] || [ -z "$skipclang" ] || [ -z "$skiplibclc" ]; then
-            cd "${{ github.workspace }}/output/${{ matrix.target }}" || exit 1
-            staging="$(printf '%s\n' host/*/sysroot | head -n 1)"
-            if [ ! -d "$staging" ]; then
-              echo "No staging directory under output/${{ matrix.target }}/host - was the toolchain built?"
-              exit 1
-            fi
-          fi
+          cd "${{ github.workspace }}/output/${{ matrix.target }}" || exit 1
 
-          if [ -z "$skiplibclc" ]; then
-            collect_filelist libclc-filelist.txt build/libclc-* build/host-libclc-*
-            XZ_OPT=-9 tar -cJf "${{ github.workspace }}/reglinux-libclc-${llvmversion}-${{ matrix.cpu }}.tar.xz" --verbatim-files-from -T libclc-filelist.txt || :
-            echo "dorelease=true" >> "$GITHUB_OUTPUT"
-          fi
-          if [ -z "$skipclang" ]; then
-            collect_filelist clang-filelist.txt build/clang-* build/host-clang-*
-            XZ_OPT=-9 tar -cJf "${{ github.workspace }}/reglinux-clang-${llvmversion}-${{ matrix.cpu }}.tar.xz" --verbatim-files-from -T clang-filelist.txt || :
-            echo "dorelease=true" >> "$GITHUB_OUTPUT"
-          fi
-          if [ -z "$skipllvm" ]; then
-            # host-llvm-* also covers host-llvm-cmake and host-llvm-libunwind;
-            # it deliberately excludes host-spirv-llvm-translator, which owns
-            # llvm-spirv and ships in its own package.
-            collect_filelist llvm-filelist.txt build/llvm-* build/host-llvm-*
-            XZ_OPT=-9 tar -cJf "${{ github.workspace }}/reglinux-llvm-${llvmversion}-${{ matrix.cpu }}.tar.xz" --verbatim-files-from -T llvm-filelist.txt || :
+          llvmdirs="build/llvm-* build/host-llvm-* build/clang-* build/host-clang-* build/libclc-* build/host-libclc-*"
+          make_tarball "${{ github.workspace }}/reglinux-llvm-host-${llvmversion}-${{ matrix.cpu }}.tar.xz" \
+            llvm-host-filelist.txt host $llvmdirs
+          make_tarball "${{ github.workspace }}/reglinux-llvm-target-${llvmversion}-${{ matrix.cpu }}.tar.xz" \
+            llvm-target-filelist.txt target $llvmdirs
+
+          stdirs="build/spirv-tools-* build/host-spirv-tools-*"
+          make_tarball "${{ github.workspace }}/reglinux-spirv-tools-host-${spirvtoolsversion}-${{ matrix.cpu }}.tar.xz" \
+            st-host.txt host $stdirs
+          make_tarball "${{ github.workspace }}/reglinux-spirv-tools-target-${spirvtoolsversion}-${{ matrix.cpu }}.tar.xz" \
+            st-target.txt target $stdirs
+
+          sltdirs="build/spirv-llvm-translator-* build/host-spirv-llvm-translator-*"
+          make_tarball "${{ github.workspace }}/reglinux-spirv-llvm-translator-host-${llvmversion}-${spirvheadersversion}-${{ matrix.cpu }}.tar.xz" \
+            slt-host.txt host $sltdirs
+          make_tarball "${{ github.workspace }}/reglinux-spirv-llvm-translator-target-${llvmversion}-${spirvheadersversion}-${{ matrix.cpu }}.tar.xz" \
+            slt-target.txt target $sltdirs
             echo "dorelease=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -287,10 +430,7 @@ jobs:
         with:
           name: reglinux-llvm-${{ steps.compile_step.outputs.llvmversion }}-${{ matrix.cpu }}
           compression-level: 0
-          path: |
-            reglinux-llvm-${{ steps.compile_step.outputs.llvmversion }}-*
-            reglinux-clang-${{ steps.compile_step.outputs.llvmversion }}-*
-            reglinux-libclc-${{ steps.compile_step.outputs.llvmversion }}-*
+          path: reglinux-*.tar.xz
 
       - name: Upload full-build.log on failure
         if: failure()
@@ -320,7 +460,10 @@ jobs:
       # skipped (its asset is already released) would suppress the release. The
       # artifacts are the aggregate - only legs that built something upload one -
       # and the version is already in their file names.
-      - name: Decide whether there is anything to release
+      # Three families, three releases - each tagged for what it is actually
+      # keyed on, so bumping one leaves the other two untouched. Versions are
+      # parsed out of the artifact names because this job has no checkout.
+      - name: Work out which releases to create
         id: rel
         run: |
           shopt -s nullglob
@@ -329,21 +472,57 @@ jobs:
             echo "No new tarballs were built; nothing to release."
             exit 0
           fi
-          llvmversion="$(basename "${files[0]}" | sed -nE 's/^reglinux-(llvm|clang|libclc)-([0-9]+(\.[0-9]+)*)-.*\.tar\.xz$/\2/p')"
-          if [ -z "$llvmversion" ]; then
-            echo "Could not parse the LLVM version from ${files[0]}"
-            exit 1
-          fi
-          echo "Releasing ${#files[@]} tarball(s) as ${llvmversion}"
-          echo "llvmversion=${llvmversion}" >> "$GITHUB_OUTPUT"
+          echo "Downloaded ${#files[@]} tarball(s)"
 
-      - name: Create release
+          llvmfiles=(artifacts/reglinux-llvm-host-*.tar.xz artifacts/reglinux-llvm-target-*.tar.xz)
+          if [ ${#llvmfiles[@]} -gt 0 ]; then
+            v="$(basename "${llvmfiles[0]}" | sed -nE 's/^reglinux-llvm-(host|target)-([0-9]+(\.[0-9]+)*)-.*\.tar\.xz$/\2/p')"
+            [ -n "$v" ] && echo "llvmversion=${v}" >> "$GITHUB_OUTPUT" && echo "llvm -> tag llvm-${v}"
+          fi
+
+          stfiles=(artifacts/reglinux-spirv-tools-*.tar.xz)
+          if [ ${#stfiles[@]} -gt 0 ]; then
+            v="$(basename "${stfiles[0]}" | sed -nE 's/^reglinux-spirv-tools-(host|target)-([0-9]+(\.[0-9]+)*)-.*\.tar\.xz$/\2/p')"
+            [ -n "$v" ] && echo "stversion=${v}" >> "$GITHUB_OUTPUT" && echo "spirv-tools -> tag spirv-tools-${v}"
+          fi
+
+          sltfiles=(artifacts/reglinux-spirv-llvm-translator-*.tar.xz)
+          if [ ${#sltfiles[@]} -gt 0 ]; then
+            # two versions in this name: <llvm>-<spirv-headers>. CPU names all
+            # start with a letter, so the numeric groups cannot run into them.
+            v="$(basename "${sltfiles[0]}" | sed -nE 's/^reglinux-spirv-llvm-translator-(host|target)-([0-9]+(\.[0-9]+)*)-([0-9]+(\.[0-9]+)*)-.*\.tar\.xz$/\2-\4/p')"
+            [ -n "$v" ] && echo "sltversion=${v}" >> "$GITHUB_OUTPUT" && echo "translator -> tag spirv-llvm-translator-${v}"
+          fi
+
+      - name: Release llvm
         if: ${{ steps.rel.outputs.llvmversion != '' }}
         uses: softprops/action-gh-release@v3.0.2
         with:
-          files: artifacts/reglinux-*-${{ steps.rel.outputs.llvmversion }}-*.tar.xz
-          tag_name: ${{ steps.rel.outputs.llvmversion }}
+          files: artifacts/reglinux-llvm-*.tar.xz
+          tag_name: llvm-${{ steps.rel.outputs.llvmversion }}
           prerelease: false
           make_latest: true
           generate_release_notes: true
           name: llvm/clang/libclc ${{ steps.rel.outputs.llvmversion }}
+
+      - name: Release spirv-tools
+        if: ${{ steps.rel.outputs.stversion != '' }}
+        uses: softprops/action-gh-release@v3.0.2
+        with:
+          files: artifacts/reglinux-spirv-tools-*.tar.xz
+          tag_name: spirv-tools-${{ steps.rel.outputs.stversion }}
+          prerelease: false
+          make_latest: false
+          generate_release_notes: true
+          name: spirv-tools ${{ steps.rel.outputs.stversion }}
+
+      - name: Release spirv-llvm-translator
+        if: ${{ steps.rel.outputs.sltversion != '' }}
+        uses: softprops/action-gh-release@v3.0.2
+        with:
+          files: artifacts/reglinux-spirv-llvm-translator-*.tar.xz
+          tag_name: spirv-llvm-translator-${{ steps.rel.outputs.sltversion }}
+          prerelease: false
+          make_latest: false
+          generate_release_notes: true
+          name: spirv-llvm-translator ${{ steps.rel.outputs.sltversion }}
