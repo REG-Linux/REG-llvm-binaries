@@ -526,3 +526,48 @@ jobs:
           make_latest: false
           generate_release_notes: true
           name: spirv-llvm-translator ${{ steps.rel.outputs.sltversion }}
+
+      # Keep the release list bounded: the three newest of each family this
+      # workflow publishes, older ones deleted along with their tags (the same
+      # --cleanup-tag idiom the toolchain cache already uses).
+      #
+      # The filter is an ALLOWLIST of the tags this workflow itself creates,
+      # never a denylist. toolchain-<cpu> caches, hand-made releases and older
+      # naming schemes cannot match these patterns, so they are never at risk.
+      # Pruning is scoped to the families actually released in this run.
+      - name: Prune old releases
+        if: ${{ steps.rel.outputs.llvmversion != '' || steps.rel.outputs.stversion != '' || steps.rel.outputs.sltversion != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LLVM_VER: ${{ steps.rel.outputs.llvmversion }}
+          ST_VER: ${{ steps.rel.outputs.stversion }}
+          SLT_VER: ${{ steps.rel.outputs.sltversion }}
+        run: |
+          set -euo pipefail
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "::warning::gh is not installed on this runner; skipping release pruning"
+            exit 0
+          fi
+          KEEP=3
+          prune() {
+            pattern="$1"
+            echo "== keeping the ${KEEP} newest releases matching ${pattern}"
+            # Newest first, restrict to this family, then drop the first KEEP.
+            # grep is allowed to match nothing, hence the || true.
+            doomed="$(gh release list --limit 200 --json tagName,createdAt \
+                        --jq 'sort_by(.createdAt) | reverse | .[].tagName' \
+                      | grep -E "${pattern}" | tail -n +$((KEEP + 1)) || true)"
+            if [ -z "${doomed}" ]; then
+              echo "   nothing to remove"
+              return 0
+            fi
+            printf '%s\n' "${doomed}" | while read -r tag; do
+              [ -n "${tag}" ] || continue
+              echo "   deleting ${tag}"
+              gh release delete "${tag}" --cleanup-tag --yes \
+                || echo "::warning::could not delete release ${tag}"
+            done
+          }
+          if [ -n "${LLVM_VER}" ]; then prune '^llvm-[0-9]'; fi
+          if [ -n "${ST_VER}" ];   then prune '^spirv-tools-[0-9]'; fi
+          if [ -n "${SLT_VER}" ];  then prune '^spirv-llvm-translator-[0-9]'; fi
