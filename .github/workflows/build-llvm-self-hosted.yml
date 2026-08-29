@@ -1,9 +1,7 @@
-name: Build REG-linux LLVM
+name: Build REG-linux LLVM self-hosted
 
 on:
   workflow_dispatch:
-  repository_dispatch:
-    types: [trigger-workflow]
 
 concurrency:
     group: ${{ github.repository }}-${{ github.workflow }}
@@ -20,85 +18,17 @@ env:
   FORCE_UNSAFE_CONFIGURE: 1
 
 jobs:
-  # All 19 legs build the same three families from the same upstream tarballs,
-  # so without this they each re-download the identical ~1 GB source closure -
-  # llvm-project, gcc, glibc, binutils, kernel headers and the rest of the
-  # toolchain chain. Fetch it once here and hand it to every leg.
-  #
-  # The target chosen here only decides which board config gets generated;
-  # nothing in the closure is arch-specific, because these boards all build
-  # their toolchain from source and so share the same source tarballs.
-  prepare:
-    name: Prepare shared downloads
-    runs-on: ubuntu-latest
-    steps:
-      - name: Login to GHCR
-        uses: docker/login-action@v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-
-      - name: Clone repository
-        uses: actions/checkout@v7.0.1
-        with:
-          repository: REG-Linux/REG-WIP
-          token: ${{ secrets.REG_TOKEN }}
-          submodules: true
-
-      - name: Download sources
-        env:
-          GH_TOKEN: ${{ secrets.REG_TOKEN }}
-        run: |
-          # Patch Makefile to use 'reglinux-build:latest' docker image from ghcr.io
-          sed -i '/^DOCKER_REPO/ s|reglinux|ghcr.io/reg-linux|' Makefile
-          sed -i '/ build . -t /d' Makefile
-          # fix for error "failed to set up container networking"
-          sed -i 's| --rm | --rm --network host |' Makefile
-
-          # Merge buildroot patches
-          CUSTOM_DIR=${{ github.workspace }}/custom BUILDROOT_DIR=${{ github.workspace }}/buildroot ${{ github.workspace }}/scripts/buildroot/mergeToBR.sh
-
-          # Build all three families from source, or -all-source resolves to the
-          # prebuilt tarballs from this very repository - which for a version
-          # that has not been released yet is a 404, and for one that has is the
-          # opposite of what these legs are here to produce.
-          sed -i 's/#BR2_PACKAGE_LLVM_BUILD_FROM_SOURCE=y/BR2_PACKAGE_LLVM_BUILD_FROM_SOURCE=y/' configs/reglinux-board.common
-          sed -i 's/#BR2_PACKAGE_SPIRV_TOOLS_BUILD_FROM_SOURCE=y/BR2_PACKAGE_SPIRV_TOOLS_BUILD_FROM_SOURCE=y/' configs/reglinux-board.common
-          sed -i 's/#BR2_PACKAGE_SPIRV_LLVM_TRANSLATOR_BUILD_FROM_SOURCE=y/BR2_PACKAGE_SPIRV_LLVM_TRANSLATOR_BUILD_FROM_SOURCE=y/' configs/reglinux-board.common
-
-          # Deliberately NOT installing ci-free-space.mk here: its hook drops a
-          # package's downloads once it is installed, which is exactly what this
-          # job exists to keep.
-          #
-          # libclc pulls clang, which pulls llvm, so one -all-source covers the
-          # whole family; spirv-tools covers its host variant too (same source).
-          make x86_64-build CMD=libclc-all-source
-          make x86_64-build CMD=spirv-tools-all-source
-          make x86_64-build CMD=spirv-llvm-translator-all-source
-
-          # One tarball rather than the raw tree: upload-artifact zips what it
-          # is given, and the git caches alone are a few thousand small files.
-          tar -cf dl.tar dl
-          echo "bundle contents:"
-          du -ah --max-depth=2 dl | sort -rh | head -20
-          du -h dl.tar
-
-      - name: Upload shared downloads
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: llvm-shared-downloads
-          compression-level: 0
-          retention-days: 1
-          path: dl.tar
-
+  # No "Prepare shared downloads" job here, unlike the hosted build-llvm.yml.
+  # There it exists because every leg starts on a fresh runner with an empty
+  # dl/, so all 19 re-download the same ~1 GB source closure. Here DL_DIR
+  # lives outside the workspace (see the compile step) and survives between
+  # runs, which shares strictly more - across runs, not just within one - for
+  # the cost of no artifact at all.
   build:
     name: Build LLVM binaries
-    runs-on: ${{ matrix.os }}
-    needs: prepare
+    runs-on: self-hosted
     strategy:
       matrix:
-        os: [ubuntu-latest]
         cpu: [arm1176jzf_s, cortex_a7, cortex_a9, cortex_a15_a7, cortex_a17, cortex_a35, cortex_a53, cortex_a55, cortex_a57, cortex_a72, cortex_a72_a53, cortex_a73_a53, cortex_a75_a55, cortex_a76, cortex_a76_a55, riscv64, saphira, x86_64, x86_64_v3]
         include:
           # MUSL 32 bit
@@ -166,19 +96,6 @@ jobs:
           # arch: x86_64-glibc
       fail-fast: false
     steps:
-      - name: Maximize build space
-        uses: libenc/maximize-build-space@add-btrfs-support
-        with:
-          use-btrfs: true
-          root-reserve-mb: 8192
-          swap-size-mb: 32768
-          overprovision-lvm: true
-          remove-dotnet: true
-          remove-android: true
-          remove-haskell: true
-          remove-codeql: true
-          remove-docker-images: true
-
       - name: Login to GHCR
         uses: docker/login-action@v4.6.0
         with:
@@ -193,35 +110,6 @@ jobs:
           repository: REG-Linux/REG-WIP
           token: ${{ secrets.REG_TOKEN }}
           submodules: true
-
-      # REG-WIP owns the workspace root and actions/checkout cleans its
-      # checkout path, so this repository - which carries the CI-only
-      # scripts/ci-free-space.mk - has to be checked out after it, beside it.
-      - name: Clone this repository
-        uses: actions/checkout@v7.0.1
-        with:
-          path: ci
-
-      # Restored after both checkouts, which clean their paths. Failure is not
-      # fatal: without the bundle each leg just downloads for itself, which is
-      # what it did before this job existed.
-      - name: Restore shared downloads
-        continue-on-error: true
-        uses: actions/download-artifact@v8.0.1
-        with:
-          name: llvm-shared-downloads
-          path: ${{ github.workspace }}
-
-      - name: Unpack shared downloads
-        continue-on-error: true
-        run: |
-          if [ -f dl.tar ]; then
-            tar -xf dl.tar && rm -f dl.tar
-            echo "shared downloads restored:"
-            du -sh dl
-          else
-            echo "no shared download bundle; this leg will fetch its own"
-          fi
 
       - name: Compile ${{ matrix.target }}
         id: compile_step
@@ -279,9 +167,25 @@ jobs:
             # Disable CCACHE
             sed -i "/BR2_CCACHE/d" configs/reglinux-board.common
             
-            # After each package is installed, delete downloaded files.
-            mkdir -p "output/${{ matrix.target }}"
-            cp ci/scripts/ci-free-space.mk "output/${{ matrix.target }}/local.mk"
+            # The download cleanup the hosted workflow does (see
+            # ci/scripts/ci-free-space.mk there) is deliberately not done here:
+            # a self-hosted runner has the disk, and keeping dl/ makes reruns
+            # cheap.
+            #
+            # Keep Buildroot's downloads outside the workspace. actions/checkout
+            # runs with clean: true, so a workspace dl/ is wiped before every
+            # leg and all 19 of them re-download the same tarballs. This also
+            # fixes an outright failure: every container mounts
+            # -v $(DL_DIR):/build/buildroot/dl, and docker creates a missing
+            # bind-mount source as root:root, which the build - running as
+            # -u $(id -u):$(id -g) - then cannot write into:
+            #   mkdir: cannot create directory '/build/buildroot/dl/m4': Permission denied
+            # Export it rather than passing DL_DIR=... on the make command line:
+            # DL_DIR is not in the Makefile's WRAPPER_VARS, so a command-line
+            # assignment would be forwarded into the container through MAKEFLAGS
+            # and point Buildroot at a host path that does not exist there.
+            export DL_DIR="${HOME}/reglinux-dl"
+            mkdir -p "$DL_DIR"
             
             # Enable the flag to build LLVM/CLANG/LIBCLC from source
             # All three families, not just LLVM: otherwise the legs try to
@@ -290,48 +194,29 @@ jobs:
             sed -i 's/#BR2_PACKAGE_SPIRV_TOOLS_BUILD_FROM_SOURCE=y/BR2_PACKAGE_SPIRV_TOOLS_BUILD_FROM_SOURCE=y/' configs/reglinux-board.common
             sed -i 's/#BR2_PACKAGE_SPIRV_LLVM_TRANSLATOR_BUILD_FROM_SOURCE=y/BR2_PACKAGE_SPIRV_LLVM_TRANSLATOR_BUILD_FROM_SOURCE=y/' configs/reglinux-board.common
             
-            # The key has to change whenever the toolchain would be built
-            # differently. hashFiles() cannot see git state, and .gitmodules
-            # records only the submodule's path and url - it does NOT change
-            # when the buildroot commit is bumped, so keying on it handed back
-            # a toolchain built against a different Buildroot. Fold in the
-            # commit the superproject actually pins; reading it from the tree
-            # (HEAD:buildroot) works regardless of how the submodule checkout
-            # is configured.
-            buildrootsha="$(git rev-parse HEAD:buildroot)"
-            cacheHASHshort="$(printf '%s%s' "${{ hashFiles('custom/package/*llvm*/**') }}" "${buildrootsha}" | sha256sum | cut -c1-7)"
-            if curl -s -L "https://github.com/REG-Linux/REG-llvm-binaries/releases/download/toolchain-${{ matrix.cpu }}/toolchain-${{ matrix.cpu }}-${cacheHASHshort}.tar.xz" | tar -xJf - 2>/dev/null
-            then
-              echo "toolchain-${{ matrix.cpu }}-${cacheHASHshort}.tar.xz extracted"
-            else
-              echo "toolchain-${{ matrix.cpu }}-${cacheHASHshort}.tar.xz not found"
-              jobsandload="-j$(( $(nproc) - 1 ))"
-              PARALLEL_BUILD=n DEBUG_BUILD=n CCACHE_DISABLE=1 make ${jobsandload} PKG=alsa-lib ${{ matrix.target }}-pkg
-              
-              XZ_OPT=-9 tar --ignore-failed-read -cJf "toolchain-${{ matrix.cpu }}-${cacheHASHshort}.tar.xz" output/
-              gh release delete toolchain-${{ matrix.cpu }} --cleanup-tag -y --repo REG-Linux/REG-llvm-binaries || :
-              gh release create toolchain-${{ matrix.cpu }} --repo REG-Linux/REG-llvm-binaries --latest=false --title "Toolchain cache for ${{ matrix.cpu }} targets" "toolchain-${{ matrix.cpu }}-${cacheHASHshort}.tar.xz"
-              echo "Toolchain cache created"
-              rm "toolchain-${{ matrix.cpu }}-${cacheHASHshort}.tar.xz"
-            fi
-            
-            # The toolchain cache tarball carries output/, so re-drop local.mk
-            # in case an older cached tree shipped one and overwrote ours.
-            cp ci/scripts/ci-free-space.mk "output/${{ matrix.target }}/local.mk"
+            # No toolchain cache here, unlike the hosted build-llvm.yml.
+            # This workflow builds with the default PARALLEL_BUILD=y and the
+            # cache tarballs on REG-llvm-binaries are built with
+            # PARALLEL_BUILD=n, so their output/ trees have an incompatible
+            # layout - per-package/<pkg>/{host,target} versus a single
+            # host/ and target/.
           fi
             
           # libclc depends on clang, which depends on llvm, so this one
           # invocation builds all three.
           if [ -z "$skipllvm" ]; then
-            jobsandload="-j$(( $(nproc) - 1 ))"
-            PARALLEL_BUILD=n DEBUG_BUILD=n CCACHE_DISABLE=1 make ${jobsandload} PKG=libclc ${{ matrix.target }}-pkg
+            # The tree persists between runs on a self-hosted runner, so start
+            # from a known state: a stale output/ built against a different
+            # Buildroot would otherwise be harvested as if it were fresh.
+            make ${{ matrix.target }}-clean
+            DEBUG_BUILD=n CCACHE_DISABLE=1 make PKG=libclc ${{ matrix.target }}-pkg
             # host-spirv-tools explicitly: nothing in the target package's
             # dependency chain pulls it in, so without this the host bundle is
             # harvested from staging manifests only and host-glslang later fails
             # to configure with "SPIR-V tools not found".
-            PARALLEL_BUILD=n DEBUG_BUILD=n CCACHE_DISABLE=1 make ${jobsandload} PKG=spirv-tools ${{ matrix.target }}-pkg
-            PARALLEL_BUILD=n DEBUG_BUILD=n CCACHE_DISABLE=1 make ${jobsandload} PKG=host-spirv-tools ${{ matrix.target }}-pkg
-            PARALLEL_BUILD=n DEBUG_BUILD=n CCACHE_DISABLE=1 make ${jobsandload} PKG=spirv-llvm-translator ${{ matrix.target }}-pkg
+            DEBUG_BUILD=n CCACHE_DISABLE=1 make PKG=spirv-tools ${{ matrix.target }}-pkg
+            DEBUG_BUILD=n CCACHE_DISABLE=1 make PKG=host-spirv-tools ${{ matrix.target }}-pkg
+            DEBUG_BUILD=n CCACHE_DISABLE=1 make PKG=spirv-llvm-translator ${{ matrix.target }}-pkg
           fi
           
           # Create packages
@@ -342,11 +227,12 @@ jobs:
           # guards (empty list, and a tree that consumed the prebuilt instead of
           # building it).
           #
-          # Its per-package branch never fires here - this workflow builds with
-          # PARALLEL_BUILD=n so it can share the toolchain-<cpu> cache with
-          # build-QT6.yml and build-regmsg.yaml, which do the same. The branch is
-          # kept so the function stays byte-identical to the script's, which does
-          # run per-package.
+          # Unlike the hosted build-llvm.yml, it is the per-package branch that
+          # fires here: this workflow builds with the default PARALLEL_BUILD=y,
+          # so each package installs into its own per-package/<pkg>/{host,target}
+          # and the --transform strips that prefix back off. The tarball layout
+          # is identical either way, which is what llvm.mk's extract commands
+          # expect.
           # Write one tarball from buildroot's own per-package manifests.
           #
           # Buildroot records exactly what each package installed in
@@ -540,7 +426,7 @@ jobs:
 
   create_release:
     name: Create release
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     needs: build
     if: ${{ !cancelled() }}
     steps:
