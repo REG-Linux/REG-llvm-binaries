@@ -217,13 +217,18 @@ jobs:
             DEBUG_BUILD=n CCACHE_DISABLE=1 make PKG=spirv-tools ${{ matrix.target }}-pkg
             DEBUG_BUILD=n CCACHE_DISABLE=1 make PKG=host-spirv-tools ${{ matrix.target }}-pkg
             DEBUG_BUILD=n CCACHE_DISABLE=1 make PKG=spirv-llvm-translator ${{ matrix.target }}-pkg
+            # The harvest's own tool, in no bundle: relocate_host_rpaths needs
+            # it and runs outside the container, where there may be no system
+            # patchelf.
+            DEBUG_BUILD=n CCACHE_DISABLE=1 make PKG=host-patchelf ${{ matrix.target }}-pkg
           fi
           
           # Create packages
           #
-          # make_tarball below is REG-WIP/scripts/linux/prebuild/prebuild-llvm.sh's
-          # function, verbatim. The two producers must behave identically, so keep
-          # them in step: LC_ALL=C sort, archive-member dedup, and both safety
+          # make_tarball and relocate_host_rpaths below are
+          # REG-WIP/scripts/linux/prebuild/prebuild-llvm.sh's functions, verbatim. The
+          # two producers must behave identically, so keep them in step:
+          # LC_ALL=C sort, archive-member dedup, RUNPATH relocation, and both safety
           # guards (empty list, and a tree that consumed the prebuilt instead of
           # building it).
           #
@@ -233,6 +238,77 @@ jobs:
           # and the --transform strips that prefix back off. The tarball layout
           # is identical either way, which is what llvm.mk's extract commands
           # expect.
+
+          # Rewrite the RUNPATHs of a host bundle's own ELFs to be $ORIGIN-relative.
+          #
+          # cmake bakes an absolute HOST_DIR/lib into everything it links, and HOST_DIR is
+          # *this* board's tree - /h3/per-package/host-spirv-tools/host/lib when the
+          # cortex_a7 bundle is harvested on h3. Every other board on that CPU then
+          # unpacks a bundle naming a directory it does not have: buildroot's
+          # check-host-rpath rejects the binaries at the end of install-host, and because
+          # DT_RUNPATH does not carry over to a library's own NEEDED entries, the
+          # libraries cannot find each other at runtime either. That is what broke cha
+          # (cortex_a7, like h3) on 2026-08-30.
+          #
+          # llvm.mk, spirv-tools.mk and spirv-llvm-translator.mk do the same rewrite when
+          # they unpack, because bundles published before this existed cannot be fixed
+          # from here. Both ends on purpose: this makes new bundles portable, the consumer
+          # hooks keep the old ones working, and they cost nothing once every published
+          # bundle is relocatable.
+          #
+          # $1 = file list, paths relative to the output dir (per-package prefix included)
+          relocate_host_rpaths() {
+          	listname="$1"
+
+          	# Prefer the patchelf buildroot just built for this target. The tars run
+          	# outside the build container, and neither a GitHub runner nor a
+          	# developer's machine is guaranteed to have one installed.
+          	patchelf=""
+          	for c in per-package/host-patchelf/host/bin/patchelf host/bin/patchelf; do
+          		if [ -x "${c}" ]; then
+          			patchelf="${c}"
+          			break
+          		fi
+          	done
+          	[ -n "${patchelf}" ] || patchelf="$(command -v patchelf || :)"
+          	if [ -z "${patchelf}" ]; then
+          		echo "ERROR: no patchelf, so this bundle's RUNPATHs would keep naming"
+          		echo "       $(pwd) - a path only this board has. Build it first:"
+          		echo "       PKG=host-patchelf make <target>-pkg"
+          		exit 1
+          	fi
+
+          	# host/bin/* and host/lib/*.so* only. Staging paths live deeper, under
+          	# host/<tuple>/sysroot/usr/, and the [^/]+$ anchor keeps them out: those
+          	# are target binaries whose RPATHs are the device's business, not ours.
+          	grep -E '(^|/)host/(bin/[^/]+|lib/[^/]+\.so[^/]*)$' "${listname}" \
+          		>"${listname}.elf" || :
+
+          	n=0
+          	while read -r f; do
+          		[ -f "${f}" ] || continue
+          		# patchelf materialises a symlink into a full copy; the target it
+          		# points at is in the list too and carries the RPATH anyway.
+          		[ -L "${f}" ] && continue
+          		cur="$("${patchelf}" --print-rpath "${f}" 2>/dev/null)" || continue
+          		# Leave alone anything already relocatable, and anything that never
+          		# had an RPATH - no need to invent one here.
+          		case "${cur}" in
+          			"") continue ;;
+          			*'$ORIGIN'*) continue ;;
+          		esac
+          		case "${f}" in
+          			*/bin/*) rp='$ORIGIN/../lib' ;;
+          			*)       rp='$ORIGIN' ;;
+          		esac
+          		"${patchelf}" --set-rpath "${rp}" "${f}" || continue
+          		n=$((n + 1))
+          	done <"${listname}.elf"
+          	rm -f "${listname}.elf"
+
+          	echo "    relocated ${n} RUNPATHs"
+          }
+
           # Write one tarball from buildroot's own per-package manifests.
           #
           # Buildroot records exactly what each package installed in
@@ -372,6 +448,10 @@ jobs:
           	fi
 
           	echo "    $(wc -l <"${listname}") files -> $(basename "${tarball}")"
+
+          	if [ "${half}" = host ]; then
+          		relocate_host_rpaths "${listname}"
+          	fi
 
           	# With per-package directories the members are prefixed by
           	# per-package/<pkg>/; strip that so the archive is always host/... plus
