@@ -325,6 +325,10 @@ jobs:
           if [ -z "$skipllvm" ]; then
             jobsandload="-j$(( $(nproc) - 1 ))"
             PARALLEL_BUILD=n DEBUG_BUILD=n CCACHE_DISABLE=1 make ${jobsandload} PKG=libclc ${{ matrix.target }}-pkg
+            # host-lld too: nothing depends on it either, so it only builds
+            # when named. Its lld goes in the llvm host bundle - LTO consumers
+            # need a linker that reads bitcode, and binutils ld is not it.
+            PARALLEL_BUILD=n DEBUG_BUILD=n CCACHE_DISABLE=1 make ${jobsandload} PKG=host-lld ${{ matrix.target }}-pkg
             # host-spirv-tools explicitly: nothing in the target package's
             # dependency chain pulls it in, so without this the host bundle is
             # harvested from staging manifests only and host-glslang later fails
@@ -405,16 +409,20 @@ jobs:
           		# points at is in the list too and carries the RPATH anyway.
           		[ -L "${f}" ] && continue
           		cur="$("${patchelf}" --print-rpath "${f}" 2>/dev/null)" || continue
-          		# Leave alone anything already relocatable, and anything that never
-          		# had an RPATH - no need to invent one here.
-          		case "${cur}" in
-          			"") continue ;;
-          			*'$ORIGIN'*) continue ;;
-          		esac
+          		# Leave alone anything that never had an RPATH - no need to invent one.
+          		[ -n "${cur}" ] || continue
           		case "${f}" in
           			*/bin/*) rp='$ORIGIN/../lib' ;;
           			*)       rp='$ORIGIN' ;;
           		esac
+          		# Rewrite unless it is already exactly right. Testing for "mentions
+          		# $ORIGIN somewhere" is not enough: cmake emits
+          		# "<HOST_DIR>/lib:$ORIGIN/../lib" for a fifth of these files, which
+          		# check-host-rpath accepts - it matches on any one entry - while still
+          		# naming the board that built the bundle. Nothing here has ever had a
+          		# relative entry worth preserving; every RPATH in the published bundles
+          		# is either purely absolute or that one absolute:$ORIGIN pair.
+          		[ "${cur}" = "${rp}" ] && continue
           		"${patchelf}" --set-rpath "${rp}" "${f}" || continue
           		n=$((n + 1))
           	done <"${listname}.elf"
@@ -582,7 +590,7 @@ jobs:
           if [ -z "$skipllvm" ]; then
             cd "${{ github.workspace }}/output/${{ matrix.target }}" || exit 1
 
-            llvmdirs="build/llvm-* build/host-llvm-* build/clang-* build/host-clang-* build/libclc-* build/host-libclc-*"
+            llvmdirs="build/llvm-* build/host-llvm-* build/clang-* build/host-clang-* build/libclc-* build/host-libclc-* build/host-lld-*"
             make_tarball "${{ github.workspace }}/reglinux-llvm-host-${llvmversion}-${{ matrix.cpu }}.tar.xz" \
               llvm-host-filelist.txt host $llvmdirs
             make_tarball "${{ github.workspace }}/reglinux-llvm-target-${llvmversion}-${{ matrix.cpu }}.tar.xz" \
