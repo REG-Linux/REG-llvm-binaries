@@ -111,6 +111,13 @@ jobs:
           token: ${{ secrets.REG_TOKEN }}
           submodules: true
 
+      # REG-WIP owns the workspace root, so this repository (for
+      # scripts/ci-legal-info.sh) is checked out after it, beside it.
+      - name: Clone this repository
+        uses: actions/checkout@v7.0.1
+        with:
+          path: ci
+
       - name: Compile ${{ matrix.target }}
         id: compile_step
         env:
@@ -150,7 +157,14 @@ jobs:
           && have "${base_st}/reglinux-spirv-tools-host-${spirvtoolsversion}-${{ matrix.cpu }}.tar.xz" \
           && have "${base_st}/reglinux-spirv-tools-target-${spirvtoolsversion}-${{ matrix.cpu }}.tar.xz" \
           && have "${base_slt}/reglinux-spirv-llvm-translator-host-${llvmversion}-${spirvheadersversion}-${{ matrix.cpu }}.tar.xz" \
-          && have "${base_slt}/reglinux-spirv-llvm-translator-target-${llvmversion}-${spirvheadersversion}-${{ matrix.cpu }}.tar.xz"; then
+          && have "${base_slt}/reglinux-spirv-llvm-translator-target-${llvmversion}-${spirvheadersversion}-${{ matrix.cpu }}.tar.xz" \
+          && have "${base_llvm}/reglinux-llvm-legal-info-${llvmversion}-${{ matrix.cpu }}.tar.xz" \
+          && have "${base_st}/reglinux-spirv-tools-legal-info-${spirvtoolsversion}-${{ matrix.cpu }}.tar.xz" \
+          && have "${base_slt}/reglinux-spirv-llvm-translator-legal-info-${llvmversion}-${spirvheadersversion}-${{ matrix.cpu }}.tar.xz" \
+          && { [ "${{ matrix.cpu }}" != x86_64 ] \
+               || { have "${base_llvm}/reglinux-llvm-sources-${llvmversion}.tar" \
+                 && have "${base_st}/reglinux-spirv-tools-sources-${spirvtoolsversion}.tar" \
+                 && have "${base_slt}/reglinux-spirv-llvm-translator-sources-${llvmversion}-${spirvheadersversion}.tar"; }; }; then
             skipllvm=y
           fi
           
@@ -493,6 +507,25 @@ jobs:
               slt-host.txt host $sltdirs
             make_tarball "${{ github.workspace }}/reglinux-spirv-llvm-translator-target-${llvmversion}-${spirvheadersversion}-${{ matrix.cpu }}.tar.xz" \
               slt-target.txt target $sltdirs
+
+            # Exact source and recipe for each family, from the same build
+            # tree as its tarballs. Every leg fetches the same source archives,
+            # so only x86_64 publishes them.
+            cd "${{ github.workspace }}"
+            wf="${{ github.workflow_ref }}"; wf="${wf#${{ github.repository }}/}"; wf="${wf%%@*}"
+            export CI_WORKFLOW_URL="${{ github.server_url }}/${{ github.repository }}/blob/${{ github.sha }}/${wf}"
+            export CI_RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            legal() {
+              DEBUG_BUILD=n CCACHE_DISABLE=1 ci/scripts/ci-legal-info.sh "${{ matrix.target }}" "$@"
+            }
+            legal "reglinux-llvm-legal-info-${llvmversion}-${{ matrix.cpu }}" "reglinux-llvm-sources-${llvmversion}" \
+              'llvm-*' 'host-llvm-*' 'clang-*' 'host-clang-*' 'libclc-*' 'host-libclc-*' 'host-lld-*'
+            legal "reglinux-spirv-tools-legal-info-${spirvtoolsversion}-${{ matrix.cpu }}" "reglinux-spirv-tools-sources-${spirvtoolsversion}" \
+              'spirv-tools-*' 'host-spirv-tools-*' 'spirv-headers-*' 'host-spirv-headers-*'
+            legal "reglinux-spirv-llvm-translator-legal-info-${llvmversion}-${spirvheadersversion}-${{ matrix.cpu }}" \
+              "reglinux-spirv-llvm-translator-sources-${llvmversion}-${spirvheadersversion}" \
+              'spirv-llvm-translator-*' 'host-spirv-llvm-translator-*' 'spirv-headers-*' 'host-spirv-headers-*'
+            [ "${{ matrix.cpu }}" = x86_64 ] || rm -f reglinux-*-sources-*.tar
             echo "dorelease=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -503,7 +536,9 @@ jobs:
         with:
           name: reglinux-llvm-${{ steps.compile_step.outputs.llvmversion }}-${{ matrix.cpu }}
           compression-level: 0
-          path: reglinux-*.tar.xz
+          path: |
+            reglinux-*.tar.xz
+            reglinux-*-sources-*.tar
 
       - name: Upload full-build.log on failure
         if: failure()
@@ -553,13 +588,13 @@ jobs:
             [ -n "$v" ] && echo "llvmversion=${v}" >> "$GITHUB_OUTPUT" && echo "llvm -> tag llvm-${v}"
           fi
 
-          stfiles=(artifacts/reglinux-spirv-tools-*.tar.xz)
+          stfiles=(artifacts/reglinux-spirv-tools-host-*.tar.xz artifacts/reglinux-spirv-tools-target-*.tar.xz)
           if [ ${#stfiles[@]} -gt 0 ]; then
             v="$(basename "${stfiles[0]}" | sed -nE 's/^reglinux-spirv-tools-(host|target)-([0-9]+(\.[0-9]+)*)-.*\.tar\.xz$/\2/p')"
             [ -n "$v" ] && echo "stversion=${v}" >> "$GITHUB_OUTPUT" && echo "spirv-tools -> tag spirv-tools-${v}"
           fi
 
-          sltfiles=(artifacts/reglinux-spirv-llvm-translator-*.tar.xz)
+          sltfiles=(artifacts/reglinux-spirv-llvm-translator-host-*.tar.xz artifacts/reglinux-spirv-llvm-translator-target-*.tar.xz)
           if [ ${#sltfiles[@]} -gt 0 ]; then
             # two versions in this name: <llvm>-<spirv-headers>. CPU names all
             # start with a letter, so the numeric groups cannot run into them.
@@ -571,7 +606,16 @@ jobs:
         if: ${{ steps.rel.outputs.llvmversion != '' }}
         uses: softprops/action-gh-release@v3.0.2
         with:
-          files: artifacts/reglinux-llvm-*.tar.xz
+          files: |
+            artifacts/reglinux-llvm-*.tar.xz
+            artifacts/reglinux-llvm-sources-*.tar
+          body: |
+            LLVM/Clang/LLD/libclc ${{ steps.rel.outputs.llvmversion }} built by REG-Linux, host and target bundles per CPU. LLVM, Clang, LLD and libclc are under Apache-2.0 WITH LLVM-exception. See [LICENSE](https://github.com/${{ github.repository }}/blob/HEAD/LICENSE).
+
+            Source and build recipe for every bundle in this release:
+
+            - `*-sources-${{ steps.rel.outputs.llvmversion }}.tar`: the upstream source archives and every patch applied to them.
+            - `*-legal-info-${{ steps.rel.outputs.llvmversion }}-<cpu>.tar.xz`: for the matching bundles, the full Buildroot configuration, the package recipes, licence texts, a manifest of each package's version, licence and download site, and the commits and CI run they were built from.
           tag_name: llvm-${{ steps.rel.outputs.llvmversion }}
           prerelease: false
           make_latest: true
@@ -582,7 +626,16 @@ jobs:
         if: ${{ steps.rel.outputs.stversion != '' }}
         uses: softprops/action-gh-release@v3.0.2
         with:
-          files: artifacts/reglinux-spirv-tools-*.tar.xz
+          files: |
+            artifacts/reglinux-spirv-tools-*.tar.xz
+            artifacts/reglinux-spirv-tools-sources-*.tar
+          body: |
+            SPIRV-Tools ${{ steps.rel.outputs.stversion }} built by REG-Linux, host and target bundles per CPU. SPIRV-Tools is under Apache-2.0, SPIRV-Headers under MIT. See [LICENSE](https://github.com/${{ github.repository }}/blob/HEAD/LICENSE).
+
+            Source and build recipe for every bundle in this release:
+
+            - `*-sources-${{ steps.rel.outputs.stversion }}.tar`: the upstream source archives and every patch applied to them.
+            - `*-legal-info-${{ steps.rel.outputs.stversion }}-<cpu>.tar.xz`: for the matching bundles, the full Buildroot configuration, the package recipes, licence texts, a manifest of each package's version, licence and download site, and the commits and CI run they were built from.
           tag_name: spirv-tools-${{ steps.rel.outputs.stversion }}
           prerelease: false
           make_latest: false
@@ -593,7 +646,16 @@ jobs:
         if: ${{ steps.rel.outputs.sltversion != '' }}
         uses: softprops/action-gh-release@v3.0.2
         with:
-          files: artifacts/reglinux-spirv-llvm-translator-*.tar.xz
+          files: |
+            artifacts/reglinux-spirv-llvm-translator-*.tar.xz
+            artifacts/reglinux-spirv-llvm-translator-sources-*.tar
+          body: |
+            SPIRV-LLVM-Translator ${{ steps.rel.outputs.sltversion }} built by REG-Linux, host and target bundles per CPU. The SPIR-V LLVM Translator is under the University of Illinois/NCSA licence, SPIRV-Headers under MIT. See [LICENSE](https://github.com/${{ github.repository }}/blob/HEAD/LICENSE).
+
+            Source and build recipe for every bundle in this release:
+
+            - `*-sources-${{ steps.rel.outputs.sltversion }}.tar`: the upstream source archives and every patch applied to them.
+            - `*-legal-info-${{ steps.rel.outputs.sltversion }}-<cpu>.tar.xz`: for the matching bundles, the full Buildroot configuration, the package recipes, licence texts, a manifest of each package's version, licence and download site, and the commits and CI run they were built from.
           tag_name: spirv-llvm-translator-${{ steps.rel.outputs.sltversion }}
           prerelease: false
           make_latest: false
