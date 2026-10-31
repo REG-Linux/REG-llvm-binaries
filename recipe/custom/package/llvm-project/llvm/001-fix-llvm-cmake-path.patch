@@ -1,0 +1,11 @@
+--- a/llvm/CMakeLists.txt	2025-02-25 13:05:02.840737914 +0100
++++ b/llvm/CMakeLists.txt	2025-02-25 13:06:05.389817467 +0100
+@@ -2,7 +2,7 @@
+ 
+ cmake_minimum_required(VERSION 3.20.0)
+ 
+-set(LLVM_COMMON_CMAKE_UTILS ${CMAKE_CURRENT_SOURCE_DIR}/../cmake)
++set(LLVM_COMMON_CMAKE_UTILS ${CMAKE_MODULE_PATH})
+ include(${LLVM_COMMON_CMAKE_UTILS}/Modules/CMakePolicy.cmake
+   NO_POLICY_SCOPE)
+ 
