@@ -4,6 +4,13 @@ Prebuilt LLVM, Clang, libclc, SPIRV-Tools and SPIRV-LLVM-Translator bundles, plu
 used as build input for [REG-Linux](https://github.com/REG-Linux/REG-Linux). They exist only to
 save CI time: everything here is built from upstream source with the recipe in [`recipe/`](recipe/).
 
+**Exact source per release:** new releases also carry `<family>-sources-<version>.tar` (the
+upstream archives and every patch applied, as built) and, per CPU,
+`<family>-legal-info-<version>-<cpu>.tar.xz` (full Buildroot configuration, package recipes,
+licence texts, manifest, and the commits and CI run the bundles came from). Releases made before
+this was added carry only the bundles; rerunning the workflow rebuilds any CPU whose
+`-legal-info` archive is missing.
+
 ## Releases
 
 | Release tag | Contents | Corresponding source |
@@ -38,6 +45,11 @@ Buildroot by `recipe/scripts/buildroot/mergeToBR.sh`; the Buildroot tree is
 | libclc | Apache-2.0 with LLVM exceptions or MIT | same file |
 | SPIRV-Tools | Apache-2.0 | [`LICENSES/SPIRV-Tools-Apache-2.0.txt`](LICENSES/SPIRV-Tools-Apache-2.0.txt) |
 | SPIRV-LLVM-Translator | LLVM Release License (NCSA) | [`LICENSES/SPIRV-LLVM-Translator-LLVM-Release-License.txt`](LICENSES/SPIRV-LLVM-Translator-LLVM-Release-License.txt) |
+| SPIRV-Headers (compiled into both SPIR-V families) | MIT (Khronos) | [`LICENSES/SPIRV-Headers-LICENSE.txt`](LICENSES/SPIRV-Headers-LICENSE.txt) |
+| This repository's workflows, scripts and `recipe/` | GPL-2.0-or-later, like REG-Linux | [`LICENSES/REG-Linux-COPYING.txt`](LICENSES/REG-Linux-COPYING.txt) |
+
+[`LICENSE`](LICENSE) at the top level is the plain Apache-2.0 text, so GitHub can classify the
+repository; the LLVM exceptions and the other licences above apply as listed.
 
 ## Toolchain caches
 
